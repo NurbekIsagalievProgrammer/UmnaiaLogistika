@@ -1,0 +1,214 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: root
+    volumes:
+      - .:/var/www/html
+    environment: &app_env
+      APP_NAME: "Notification Service"
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_URL: http://localhost:8080
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: notifications
+      DB_USERNAME: notifications
+      DB_PASSWORD: secret
+      CACHE_STORE: redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QUEUE_CONNECTION: rabbitmq
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      RABBITMQ_VHOST: /
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - notification
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - .:/var/www/html:ro
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
+    networks:
+      - notification
+
+  init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: root
+    command: >
+      sh -c "sh docker/wait-for-services.sh
+      && sh scripts/patch-rabbitmq-consumer.sh
+      && test -f vendor/autoload.php || composer install --no-interaction --prefer-dist
+      && php artisan key:generate --force --ansi 2>/dev/null || true
+      && php artisan migrate --force --seed"
+    volumes:
+      - .:/var/www/html
+    environment: *app_env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - notification
+
+  worker-critical:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: root
+    command: >
+      sh -c "sh docker/wait-for-services.sh
+      && sh docker/declare-queues.sh
+      && php artisan rabbitmq:consume rabbitmq
+      --queue=notifications.critical
+      --sleep=1 --tries=3 --timeout=120"
+    volumes:
+      - .:/var/www/html
+    environment: *app_env
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      - notification
+
+  worker-default:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: root
+    command: >
+      sh -c "sh docker/wait-for-services.sh
+      && sh docker/declare-queues.sh
+      && php artisan rabbitmq:consume rabbitmq
+      --queue=notifications.default
+      --sleep=1 --tries=3 --timeout=120"
+    volumes:
+      - .:/var/www/html
+    environment: *app_env
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      - notification
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: root
+    profiles:
+      - tools
+    command: >
+      sh -c "sh docker/wait-for-services.sh
+      && php artisan migrate --force --seed"
+    volumes:
+      - .:/var/www/html
+    environment: *app_env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - notification
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: root
+    profiles:
+      - tools
+    command: >
+      sh -c "sh docker/wait-for-services.sh
+      && sh scripts/patch-rabbitmq-consumer.sh
+      && test -f vendor/autoload.php || composer install --no-interaction --prefer-dist
+      && php artisan migrate:fresh --force
+      && php artisan test --testsuite=Feature
+      && php artisan test --testsuite=Integration"
+    volumes:
+      - .:/var/www/html
+    environment:
+      <<: *app_env
+      APP_ENV: testing
+      QUEUE_CONNECTION: sync
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - notification
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: notifications
+      POSTGRES_USER: notifications
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notifications -d notifications"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - notification
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - notification
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - notification
+
+networks:
+  notification:
+
+volumes:
+  postgres_data:
